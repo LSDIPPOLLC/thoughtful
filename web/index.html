@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>thoughtful — viz</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: #0e0f13; color: #d7dbe0; }
+    header { padding: 10px 16px; border-bottom: 1px solid #23262e; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    select, button, input { background: #191b22; color: #d7dbe0; border: 1px solid #2c303a; border-radius: 6px; padding: 5px 8px; font: inherit; }
+    input { min-width: 280px; }
+    button { cursor: pointer; }
+    .tab { border-color: #2c303a; }
+    .tab.active { background: #223; border-color: #3d5a99; color: #cfe0ff; }
+    main { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto auto; gap: 12px; padding: 12px; }
+    .panel { background: #14161c; border: 1px solid #23262e; border-radius: 8px; padding: 10px 12px; overflow: auto; max-height: 42vh; }
+    .panel h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: #8b93a1; }
+    .row { padding: 4px 0; border-bottom: 1px dashed #20232b; white-space: pre-wrap; }
+    .ex { color: #ff8f6b; } .sh { color: #6bd6ff; } .wait { color: #ffd36b; }
+    .seq { color: #6b7280; margin-right: 6px; }
+    #graph { grid-column: 1 / 3; max-height: none; }
+    #cy { height: 320px; width: 100%; background: #0f1116; border-radius: 6px; }
+    #graphEmpty { color: #6b7280; padding: 8px 0; }
+    code { color: #a9b4c4; }
+    /* facts */
+    #factsView { padding: 12px; display: none; }
+    #factsView.show { display: block; }
+    #runsView.hide { display: none; }
+    .meta { color: #6b7280; margin: 0 0 10px; }
+    .fact { background: #14161c; border: 1px solid #23262e; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+    .fact .txt { color: #e7ebf0; }
+    .chip { display: inline-block; background: #1d2130; color: #9fb0cc; border-radius: 10px; padding: 1px 8px; margin-right: 5px; font-size: 11px; }
+    .prov { color: #6b7280; font-size: 11px; margin-top: 4px; }
+    .dist { float: right; color: #7ee0a1; font-size: 11px; }
+    .corr { color: #ffd36b; font-size: 11px; margin-left: 6px; }
+    .sup { color: #a06b6b; font-size: 11px; margin-left: 6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>thoughtful</strong>
+    <button id="tabRuns" class="tab active">Runs</button>
+    <button id="tabFacts" class="tab">Facts</button>
+    <span id="runControls">
+      <select id="run"></select>
+      <button id="refresh">refresh</button>
+    </span>
+    <span id="factControls" style="display:none">
+      <select id="ns"></select>
+      <input id="q" placeholder="semantic search… (blank = list all)" />
+      <button id="search">search</button>
+    </span>
+    <span id="status" style="color:#6b7280"></span>
+  </header>
+
+  <main id="runsView">
+    <section class="panel" id="agents"><h2>Agents</h2></section>
+    <section class="panel" id="claims"><h2>Claims / locks</h2></section>
+    <section class="panel" id="bb"><h2>Blackboard</h2></section>
+    <section class="panel" id="journal"><h2>Journal (seq)</h2></section>
+    <section class="panel" id="graph">
+      <h2>Contention graph (wait-for)</h2>
+      <div id="graphEmpty">no contention</div>
+      <div id="cy" style="display:none"></div>
+    </section>
+  </main>
+
+  <div id="factsView">
+    <p class="meta" id="nsMeta"></p>
+    <div id="facts"></div>
+  </div>
+
+  <script src="/vendor/cytoscape.min.js"></script>
+  <script>
+    const el = (id) => document.getElementById(id);
+    let es = null, current = null;
+
+    // ---------- mode toggle ----------
+    function setMode(mode) {
+      const runs = mode === "runs";
+      el("tabRuns").classList.toggle("active", runs);
+      el("tabFacts").classList.toggle("active", !runs);
+      el("runsView").classList.toggle("hide", !runs);
+      el("factsView").classList.toggle("show", !runs);
+      el("runControls").style.display = runs ? "" : "none";
+      el("factControls").style.display = runs ? "none" : "";
+      if (!runs) loadNamespaces();
+    }
+    el("tabRuns").onclick = () => setMode("runs");
+    el("tabFacts").onclick = () => setMode("facts");
+
+    // ---------- Runs view ----------
+    async function loadRuns() {
+      const { runs } = await (await fetch("/api/runs")).json();
+      const sel = el("run"); const prev = sel.value; sel.innerHTML = "";
+      for (const r of runs) {
+        const o = document.createElement("option");
+        o.value = r.id; o.textContent = `${r.id} [${r.status}]${r.label ? " " + r.label : ""}`;
+        sel.appendChild(o);
+      }
+      if (prev) sel.value = prev;
+      if (runs[0] && !current) selectRun(runs[0].id);
+    }
+    async function refreshRun() {
+      if (!current) return;
+      const s = await (await fetch(`/api/runs/${current}/state`)).json();
+      el("agents").innerHTML = "<h2>Agents</h2>" + s.agents.map(a => `<div class="row">${a.id} ${a.left_at ? "(left)" : "●"} <code>${a.label ?? ""}</code></div>`).join("");
+      el("claims").innerHTML = "<h2>Claims / locks</h2>"
+        + s.lock.claims.map(c => `<div class="row"><span class="${c.mode === "exclusive" ? "ex" : "sh"}">${c.mode}</span> ${c.agentId} → ${c.surfaces.join(", ")}</div>`).join("")
+        + s.lock.waiters.map(w => `<div class="row wait">queued ${w.agentId} → ${w.surfaces.join(", ")} (waits: ${w.waitingFor.join(",")})</div>`).join("");
+      el("bb").innerHTML = "<h2>Blackboard</h2>" + s.blackboard.map(c => `<div class="row">${c.surface} <code>v${c.version}</code> = ${JSON.stringify(c.value)}</div>`).join("");
+      renderGraph(s.lock);
+    }
+    async function loadJournal() {
+      const { entries } = await (await fetch(`/api/runs/${current}/journal`)).json();
+      el("journal").innerHTML = "<h2>Journal (seq)</h2>" + entries.map(rowJournal).join("");
+      el("journal").scrollTop = el("journal").scrollHeight;
+    }
+    const rowJournal = (e) => `<div class="row"><span class="seq">${e.seq}</span>${e.type} <code>${e.agent_id ?? ""}</code> ${e.surface ?? ""}</div>`;
+    function selectRun(id) {
+      current = id; el("run").value = id;
+      if (es) es.close();
+      loadJournal(); refreshRun();
+      es = new EventSource(`/api/runs/${id}/stream`);
+      es.addEventListener("journal", (ev) => {
+        el("journal").insertAdjacentHTML("beforeend", rowJournal(JSON.parse(ev.data)));
+        el("journal").scrollTop = el("journal").scrollHeight; el("status").textContent = "live";
+      });
+      es.addEventListener("state", refreshRun);
+    }
+    el("run").addEventListener("change", (e) => selectRun(e.target.value));
+    el("refresh").addEventListener("click", () => { loadRuns(); refreshRun(); loadJournal(); });
+
+    // ---------- wait-for graph (Cytoscape) ----------
+    let cy = null, lastSig = "";
+    function findCyclicEdges(edges) {
+      // Mark edges that participate in a cycle (server rejects these at claim
+      // time, so normally none — defensive/illustrative).
+      const adj = new Map();
+      edges.forEach(e => { if (!adj.has(e.from)) adj.set(e.from, []); adj.get(e.from).push(e.to); });
+      const inCycle = new Set(), color = new Map();
+      const stack = [];
+      const dfs = (n) => {
+        color.set(n, 1); stack.push(n);
+        for (const m of adj.get(n) || []) {
+          if (color.get(m) === 1) { // back-edge → mark the stack segment
+            const idx = stack.indexOf(m);
+            for (let i = idx; i < stack.length; i++) inCycle.add(stack[i] + "→" + (stack[i + 1] ?? m));
+            inCycle.add(stack[stack.length - 1] + "→" + m);
+          } else if (!color.get(m)) dfs(m);
+        }
+        stack.pop(); color.set(n, 2);
+      };
+      [...adj.keys()].forEach(n => { if (!color.get(n)) dfs(n); });
+      return inCycle;
+    }
+    function renderGraph(lock) {
+      const nodes = new Set();
+      lock.claims.forEach(c => nodes.add(c.agentId));
+      lock.waiters.forEach(w => { nodes.add(w.agentId); (w.waitingFor || []).forEach(h => nodes.add(h)); });
+      lock.edges.forEach(e => { nodes.add(e.from); nodes.add(e.to); });
+
+      if (nodes.size === 0) { el("graphEmpty").style.display = ""; el("cy").style.display = "none"; return; }
+      el("graphEmpty").style.display = "none"; el("cy").style.display = "";
+
+      const waiting = new Set(lock.edges.map(e => e.from));
+      const cyclic = findCyclicEdges(lock.edges);
+      const elements = [
+        ...[...nodes].map(id => ({ data: { id, label: id.replace(/^agent_/, "") }, classes: waiting.has(id) ? "waiting" : "holder" })),
+        ...lock.edges.map((e, i) => ({ data: { id: "e" + i, source: e.from, target: e.to }, classes: cyclic.has(e.from + "→" + e.to) ? "cyc" : "" })),
+      ];
+      const sig = JSON.stringify(elements.map(x => [x.data.id, x.data.source, x.data.target, x.classes]));
+
+      if (!cy) {
+        cy = cytoscape({
+          container: el("cy"), elements,
+          style: [
+            { selector: "node", style: { "background-color": "#3d5a99", label: "data(label)", color: "#d7dbe0", "font-size": 10, "text-valign": "center", "text-halign": "center", width: 30, height: 30, "text-outline-color": "#0f1116", "text-outline-width": 2 } },
+            { selector: "node.waiting", style: { "background-color": "#c9962f" } },
+            { selector: "edge", style: { width: 2, "line-color": "#5a6683", "target-arrow-color": "#5a6683", "target-arrow-shape": "triangle", "curve-style": "bezier" } },
+            { selector: "edge.cyc", style: { "line-color": "#e0574f", "target-arrow-color": "#e0574f", width: 3 } },
+          ],
+          layout: { name: "breadthfirst", directed: true, padding: 12 },
+        });
+      } else if (sig !== lastSig) {
+        cy.json({ elements });
+        cy.layout({ name: "breadthfirst", directed: true, padding: 12 }).run();
+      }
+      lastSig = sig;
+      window.__cy = cy; // debug/inspection handle
+    }
+
+    // ---------- Facts view ----------
+    let namespaces = [];
+    async function loadNamespaces() {
+      const r = await (await fetch("/api/namespaces")).json();
+      namespaces = r.namespaces; const sel = el("ns"); const prev = sel.value; sel.innerHTML = "";
+      for (const n of namespaces) { const o = document.createElement("option"); o.value = n.name; o.textContent = n.name; sel.appendChild(o); }
+      if (prev) sel.value = prev;
+      if (namespaces[0]) { if (!sel.value) sel.value = namespaces[0].name; showFacts(); }
+      else { el("nsMeta").textContent = "no namespaces yet"; el("facts").innerHTML = ""; }
+    }
+    function nsMetaText(name) {
+      const n = namespaces.find(x => x.name === name);
+      return n ? `${n.name} · model ${n.embed_model} · dim ${n.dim} · ${n.fact_count} active facts` : name;
+    }
+    function factCard(f, dist) {
+      const tags = (f.tags || []).map(t => `<span class="chip">${t}</span>`).join("");
+      const corr = f.corroboration_count > 1 ? `<span class="corr">×${f.corroboration_count}</span>` : "";
+      const sup = f.superseded ? `<span class="sup">superseded</span>` : "";
+      const d = dist != null ? `<span class="dist">d=${dist.toFixed(3)}</span>` : "";
+      const prov = `from ${f.source_agent_id ?? "?"}${f.source_run_id ? " / " + f.source_run_id : ""}`;
+      return `<div class="fact">${d}<div class="txt">${escapeHtml(f.text)}${corr}${sup}</div><div>${tags}</div><div class="prov">${prov}</div></div>`;
+    }
+    const escapeHtml = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+    async function showFacts() {
+      const name = el("ns").value; if (!name) return;
+      el("nsMeta").textContent = nsMetaText(name);
+      const { facts } = await (await fetch(`/api/namespaces/${encodeURIComponent(name)}/facts`)).json();
+      el("facts").innerHTML = facts.length ? facts.map(f => factCard(f)).join("") : "<p class='meta'>no facts</p>";
+    }
+    async function doSearch() {
+      const name = el("ns").value, q = el("q").value.trim();
+      if (!name) return;
+      if (!q) return showFacts();
+      const r = await (await fetch(`/api/namespaces/${encodeURIComponent(name)}/search?q=${encodeURIComponent(q)}&k=10`)).json();
+      el("nsMeta").textContent = nsMetaText(name) + ` · search: "${q}"`;
+      el("facts").innerHTML = (r.hits || []).length
+        ? r.hits.map(h => factCard({ text: h.text, tags: h.tags, corroboration_count: h.corroboration_count, source_agent_id: h.provenance?.source_agent_id, source_run_id: h.provenance?.source_run_id }, h.distance)).join("")
+        : "<p class='meta'>no hits</p>";
+    }
+    el("ns").addEventListener("change", () => { el("q").value = ""; showFacts(); });
+    el("search").addEventListener("click", doSearch);
+    el("q").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+
+    // ---------- boot ----------
+    loadRuns();
+    setInterval(() => { if (el("runControls").style.display !== "none") loadRuns(); }, 5000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.db
+*.db-wal
+*.db-shm
+.env
+.DS_Store
+.playwright-mcp/
+# tool caches (not project source)
+.transcend/
+**/.impeccable/
+_probe.ts
+_reg.ts
+_t.mjs

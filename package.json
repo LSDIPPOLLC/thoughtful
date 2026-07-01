@@ -1,0 +1,32 @@
+{
+  "name": "thoughtful",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared agentic memory — MCP coordination server over Turso (v1: Blackboard + Journal + Claims).",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node --experimental-strip-types src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "distiller": "tsx src/distiller.ts",
+    "test": "tsx test/smoke.ts",
+    "test:distiller": "tsx test/distiller.ts",
+    "test:qwen": "tsx test/qwen.ts",
+    "test:qwen:e2e": "tsx test/qwen-e2e.ts"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.7.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "cytoscape": "^3.30.0",
+    "@tursodatabase/database": "^0.1.0",
+    "express": "^5.1.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
