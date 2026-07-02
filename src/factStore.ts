@@ -47,17 +47,25 @@ export interface SearchHit {
 export class FactStore {
   constructor(private db: DB, private store: Store, private embed: EmbeddingProvider) {}
 
-  /** Create-and-pin on first use; guard against embedding-model drift (ADR 0006). */
+  /**
+   * Create-and-pin on first use; guard against embedding-model drift (ADR 0006).
+   * Upsert + re-read run as ONE queued op so two concurrent writes to a brand-new
+   * namespace can't race a SELECT-then-INSERT into a PK violation.
+   */
   private async ensureNamespace(name: string): Promise<void> {
-    const row = (await this.store.query(() =>
-      this.db.prepare(`SELECT embed_model, dim FROM namespaces WHERE name = ?`).get(name))) as any;
-    if (!row) {
-      await this.store.query(() => this.db.prepare(
-        `INSERT INTO namespaces (name, embed_model, dim, created_at) VALUES (?, ?, ?, ?)`,
-      ).run(name, this.embed.name, this.embed.dim, now()));
-      return;
-    }
-    if (row.embed_model !== this.embed.name) {
+    const row = (await this.store.query(async () => {
+      await this.db.prepare(
+        `INSERT INTO namespaces (name, embed_model, dim, created_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(name) DO NOTHING`,
+      ).run(name, this.embed.name, this.embed.dim, now());
+      return this.db.prepare(`SELECT embed_model, dim FROM namespaces WHERE name = ?`).get(name);
+    })) as any;
+    this.checkPin(name, row);
+  }
+
+  /** Throw if a namespace row is pinned to a different embed model than the server's. */
+  private checkPin(name: string, row: { embed_model: string } | undefined): void {
+    if (row && row.embed_model !== this.embed.name) {
       throw new Error(
         `namespace '${name}' is pinned to embed model '${row.embed_model}' but server is configured with ` +
         `'${this.embed.name}' — a re-embed migration is required to change it (ADR 0006)`);
@@ -70,15 +78,16 @@ export class FactStore {
     return rows.map(hydrate);
   }
 
-  /** Lean fact list for the viz (no embeddings). Active only unless asked. */
-  async listFacts(namespace: string, includeSuperseded = false): Promise<{
+  /** Lean fact list for the viz + distiller catch-up (no embeddings). Active only unless asked. */
+  async listFacts(namespace: string, includeSuperseded = false, sourceRunId?: string): Promise<{
     id: string; text: string; tags: string[]; corroboration_count: number; superseded: boolean;
     source_run_id: string | null; source_agent_id: string | null; created_at: number;
   }[]> {
     const sql = `SELECT id, text, tags, corroboration_count, superseded_by, source_run_id, source_agent_id, created_at
-                 FROM facts WHERE namespace = ?${includeSuperseded ? "" : " AND superseded_by IS NULL"}
+                 FROM facts WHERE namespace = ?${includeSuperseded ? "" : " AND superseded_by IS NULL"}${sourceRunId ? " AND source_run_id = ?" : ""}
                  ORDER BY created_at DESC`;
-    const rows = (await this.store.query(() => this.db.prepare(sql).all(namespace))) as any[];
+    const args = sourceRunId ? [namespace, sourceRunId] : [namespace];
+    const rows = (await this.store.query(() => this.db.prepare(sql).all(...args))) as any[];
     return rows.map((r) => ({
       id: r.id, text: r.text, tags: r.tags ? JSON.parse(r.tags) : [],
       corroboration_count: Number(r.corroboration_count), superseded: !!r.superseded_by,
@@ -112,7 +121,7 @@ export class FactStore {
       // Near-identical: corroborate rather than store a duplicate.
       const count = best.row.corroboration_count + 1;
       await this.store.query(() => this.db.prepare(
-        `UPDATE facts SET corroboration_count = ?, created_at = created_at WHERE id = ?`).run(count, best!.row.id));
+        `UPDATE facts SET corroboration_count = ? WHERE id = ?`).run(count, best!.row.id));
       return { fact_id: best.row.id, corroborated: true, corroboration_count: count };
     }
 
@@ -131,9 +140,9 @@ export class FactStore {
   }
 
   async search(namespace: string, query: string, k: number, filter?: { tags?: string[]; minCorroboration?: number }): Promise<SearchHit[]> {
-    const nsRow = (await this.store.query(() => this.db.prepare(`SELECT name FROM namespaces WHERE name = ?`).get(namespace))) as any;
+    const nsRow = (await this.store.query(() => this.db.prepare(`SELECT name, embed_model FROM namespaces WHERE name = ?`).get(namespace))) as any;
     if (!nsRow) return [];
-    await this.ensureNamespace(namespace); // also enforces model-match guard
+    this.checkPin(namespace, nsRow); // model-match guard — search must not create the namespace
     const qvec = await this.embed.embed(query, "query");
 
     let facts = await this.activeFacts(namespace);

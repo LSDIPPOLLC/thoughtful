@@ -15,6 +15,14 @@ const shortId = (p: string) => `${p}_${randomUUID().slice(0, 8)}`;
 export class Store {
   private q = new WriteQueue();
   private seqByRun = new Map<string, number>();
+  /**
+   * Count of journal INSERTs that failed after their seq was already assigned
+   * and published to SSE (fire-and-forget durability hole — a failure here is a
+   * permanent seq gap in the durable Journal). Surfaced via /api/health; a full
+   * fix (awaiting the INSERT) would break the lock manager's synchronous
+   * mutation guarantee (ADR 0005), so v1 detects rather than prevents.
+   */
+  journalWriteFailures = 0;
 
   private constructor(private db: DB) {}
 
@@ -86,8 +94,14 @@ export class Store {
 
   journal(runId: string, agentId: string | null, type: string, surface: string | null, payload: unknown): JournalEntry {
     const entry: JournalEntry = { run_id: runId, seq: this.nextSeq(runId), agent_id: agentId, ts: now(), type, surface, payload };
-    this.q.fire(() => this.db.prepare(`INSERT INTO journal (run_id, seq, agent_id, ts, type, surface, payload) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(entry.run_id, entry.seq, entry.agent_id, entry.ts, entry.type, entry.surface, JSON.stringify(payload)));
+    let json: string;
+    try { json = JSON.stringify(payload); } catch { json = JSON.stringify({ _unserializable: true }); }
+    void this.q.run(() => this.db.prepare(`INSERT INTO journal (run_id, seq, agent_id, ts, type, surface, payload) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(entry.run_id, entry.seq, entry.agent_id, entry.ts, entry.type, entry.surface, json))
+      .catch((e) => {
+        this.journalWriteFailures++;
+        console.error(`[journal] DURABILITY: INSERT failed for run=${runId} seq=${entry.seq} type=${type} — permanent seq gap:`, e);
+      });
     bus.publishJournal(entry); // instant SSE — does not wait on the DB
     return entry;
   }
@@ -126,7 +140,10 @@ export class Store {
       `INSERT INTO blackboard (run_id, surface, value, version, author, updated_at) VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(run_id, surface) DO UPDATE SET value = excluded.value, version = excluded.version, author = excluded.author, updated_at = excluded.updated_at`,
     ).run(runId, surface, JSON.stringify(value), version, author, now()));
-    this.journal(runId, author, "blackboard.write", surface, { version });
+    // The journaled write carries the VALUE so replaying blackboard.write in seq
+    // order really does reconstruct Blackboard evolution (CONTEXT.md §Seq) —
+    // that invariant is what lets the Blackboard itself stay latest-only.
+    this.journal(runId, author, "blackboard.write", surface, { version, value });
     return version;
   }
 }

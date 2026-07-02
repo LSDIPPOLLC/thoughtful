@@ -5,7 +5,8 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 
 const BASE = `http://localhost:${process.env.PORT ?? 8795}/mcp`;
 const call = async (c: Client, name: string, args: any = {}) => {
-  const r: any = await c.callTool({ name, arguments: args });
+  // timeout > the blocking claim's long-poll, or the SDK kills the request at its 60s default
+  const r: any = await c.callTool({ name, arguments: args }, undefined, { timeout: 610_000 });
   return JSON.parse(r.content?.[0]?.text ?? "{}");
 };
 const connect = async () => { const c = new Client({ name: "seed", version: "0" }); await c.connect(new StreamableHTTPClientTransport(new URL(BASE))); return c; };

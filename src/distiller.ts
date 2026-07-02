@@ -19,6 +19,8 @@ const NAMESPACE = process.env.DISTILL_NAMESPACE ?? "distilled";
 
 export interface Distiller {
   distillRun(runId: string): Promise<number>;
+  /** Distill every ended Run not yet attributed in the namespace (missed-event recovery). */
+  catchUp(): Promise<void>;
   watch(): Promise<void>;
   close(): Promise<void>;
 }
@@ -62,6 +64,26 @@ export async function createDistiller(opts: {
     return written;
   }
 
+  /**
+   * Catch-up: distill any ended Run not yet attributed in the target namespace.
+   * The live stream only delivers `run.ended` events while we're connected — a
+   * Run that ends while the distiller is down would otherwise never be distilled.
+   * "Already distilled" = some fact (active or superseded) carries the Run's id
+   * as source_run_id; a Run whose every candidate merely corroborated existing
+   * facts leaves no such row and may be re-distilled (harmless — server dedup).
+   */
+  async function catchUp(): Promise<void> {
+    const { runs } = await getJson(`/api/runs`);
+    for (const run of runs ?? []) {
+      if (run.status !== "ended") continue;
+      const { facts } = await getJson(
+        `/api/namespaces/${encodeURIComponent(namespace)}/facts?superseded=1&source_run_id=${encodeURIComponent(run.id)}`);
+      if (facts?.length) continue;
+      console.log(`[distiller] catch-up: run ${run.id} ended while unwatched — distilling`);
+      await distillRun(run.id).catch((e) => console.error("[distiller] catch-up", e));
+    }
+  }
+
   let stop = false;
   async function watch(): Promise<void> {
     console.log(`[distiller] watching ${httpBase}/api/events → namespace '${namespace}' (${summarizer.name})`);
@@ -69,6 +91,7 @@ export async function createDistiller(opts: {
       try {
         const res = await fetch(`${httpBase}/api/events`);
         if (!res.body) throw new Error("no event stream");
+        await catchUp().catch((e) => console.error("[distiller] catch-up failed:", (e as Error).message));
         const reader = res.body.getReader();
         const dec = new TextDecoder();
         let buf = "";
@@ -95,7 +118,7 @@ export async function createDistiller(opts: {
   }
 
   async function close() { stop = true; await client.close(); }
-  return { distillRun, watch, close };
+  return { distillRun, catchUp, watch, close };
 }
 
 function parseSSE(chunk: string): { event?: string; data?: string } {
