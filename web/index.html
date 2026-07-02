@@ -23,6 +23,19 @@
     #cy { height: 320px; width: 100%; background: #0f1116; border-radius: 6px; }
     #graphEmpty { color: #6b7280; padding: 8px 0; }
     code { color: #a9b4c4; }
+    .ttl { color: #7ee0a1; font-size: 11px; margin-left: 6px; }
+    .ttl.low { color: #e0574f; }
+    .age { color: #6b7280; font-size: 11px; margin-left: 6px; }
+    #replay { display: none; align-items: center; gap: 8px; grid-column: 1 / 3; background: #14161c; border: 1px solid #3d5a99; border-radius: 8px; padding: 8px 12px; }
+    #replay.show { display: flex; }
+    #scrub { flex: 1; min-width: 120px; }
+    #scrubPos { color: #cfe0ff; min-width: 110px; text-align: right; }
+    .row.replayed { background: #181d2b; }
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+      #graph, #replay { grid-column: 1; }
+      input { min-width: 0; width: 40vw; }
+    }
     /* facts */
     #factsView { padding: 12px; display: none; }
     #factsView.show { display: block; }
@@ -40,18 +53,20 @@
 <body>
   <header>
     <strong>thoughtful</strong>
-    <button id="tabRuns" class="tab active">Runs</button>
-    <button id="tabFacts" class="tab">Facts</button>
+    <div role="tablist" aria-label="View">
+      <button id="tabRuns" class="tab active" role="tab" aria-selected="true">Runs</button>
+      <button id="tabFacts" class="tab" role="tab" aria-selected="false">Facts</button>
+    </div>
     <span id="runControls">
-      <select id="run"></select>
+      <select id="run" aria-label="Run"></select>
       <button id="refresh">refresh</button>
     </span>
     <span id="factControls" style="display:none">
-      <select id="ns"></select>
-      <input id="q" placeholder="semantic search… (blank = list all)" />
+      <select id="ns" aria-label="Namespace"></select>
+      <input id="q" placeholder="semantic search… (blank = list all)" aria-label="Semantic search" />
       <button id="search">search</button>
     </span>
-    <span id="status" style="color:#6b7280"></span>
+    <span id="status" style="color:#6b7280" role="status"></span>
   </header>
 
   <main id="runsView">
@@ -59,6 +74,12 @@
     <section class="panel" id="claims"><h2>Claims / locks</h2></section>
     <section class="panel" id="bb"><h2>Blackboard</h2></section>
     <section class="panel" id="journal"><h2>Journal (seq)</h2></section>
+    <div id="replay">
+      <span>replay</span>
+      <input id="scrub" type="range" min="0" max="0" value="0" aria-label="Replay position (seq)" />
+      <span id="scrubPos"></span>
+      <button id="scrubEnd">latest</button>
+    </div>
     <section class="panel" id="graph">
       <h2>Contention graph (wait-for)</h2>
       <div id="graphEmpty">no contention</div>
@@ -74,6 +95,9 @@
   <script src="/vendor/cytoscape.min.js"></script>
   <script>
     const el = (id) => document.getElementById(id);
+    // Agent-authored strings (labels, surfaces, journal types, blackboard values,
+    // fact text/tags) are untrusted — escape EVERYTHING interpolated into HTML.
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
     let es = null, current = null;
 
     // ---------- mode toggle ----------
@@ -81,6 +105,8 @@
       const runs = mode === "runs";
       el("tabRuns").classList.toggle("active", runs);
       el("tabFacts").classList.toggle("active", !runs);
+      el("tabRuns").setAttribute("aria-selected", String(runs));
+      el("tabFacts").setAttribute("aria-selected", String(!runs));
       el("runsView").classList.toggle("hide", !runs);
       el("factsView").classList.toggle("show", !runs);
       el("runControls").style.display = runs ? "" : "none";
@@ -91,6 +117,10 @@
     el("tabFacts").onclick = () => setMode("facts");
 
     // ---------- Runs view ----------
+    // entries: full journal cache (drives the replay scrubber); lastSeq: SSE
+    // gap-fill cursor; lastState: last /state payload (drives the lease ticker).
+    let entries = [], lastSeq = 0, lastState = null, currentStatus = "active", replaySeq = null;
+
     async function loadRuns() {
       const { runs } = await (await fetch("/api/runs")).json();
       const sel = el("run"); const prev = sel.value; sel.innerHTML = "";
@@ -102,35 +132,121 @@
       if (prev) sel.value = prev;
       if (runs[0] && !current) selectRun(runs[0].id);
     }
+    const fmtAge = (ms) => ms < 60_000 ? `${Math.round(ms / 1000)}s` : ms < 3_600_000 ? `${Math.round(ms / 60_000)}m` : `${Math.round(ms / 3_600_000)}h`;
+    function renderClaims(lock) {
+      el("claims").innerHTML = "<h2>Claims / locks</h2>"
+        + lock.claims.map(c => {
+          const left = c.expiresAt - Date.now();
+          const ttl = `<span class="ttl${left < 5000 ? " low" : ""}">lease ${left > 0 ? fmtAge(left) : "expired"}</span>`;
+          return `<div class="row"><span class="${c.mode === "exclusive" ? "ex" : "sh"}">${esc(c.mode)}</span> ${esc(c.agentId)} → ${esc(c.surfaces.join(", "))}${ttl}</div>`;
+        }).join("")
+        + lock.waiters.map(w => `<div class="row wait">queued ${esc(w.agentId)} → ${esc(w.surfaces.join(", "))} (waits: ${esc(w.waitingFor.join(","))})</div>`).join("");
+    }
+    const rowBb = (surface, version, value) =>
+      `<div class="row">${esc(surface)} <code>v${version}</code> = ${esc(JSON.stringify(value))}</div>`;
     async function refreshRun() {
       if (!current) return;
       const s = await (await fetch(`/api/runs/${current}/state`)).json();
-      el("agents").innerHTML = "<h2>Agents</h2>" + s.agents.map(a => `<div class="row">${a.id} ${a.left_at ? "(left)" : "●"} <code>${a.label ?? ""}</code></div>`).join("");
-      el("claims").innerHTML = "<h2>Claims / locks</h2>"
-        + s.lock.claims.map(c => `<div class="row"><span class="${c.mode === "exclusive" ? "ex" : "sh"}">${c.mode}</span> ${c.agentId} → ${c.surfaces.join(", ")}</div>`).join("")
-        + s.lock.waiters.map(w => `<div class="row wait">queued ${w.agentId} → ${w.surfaces.join(", ")} (waits: ${w.waitingFor.join(",")})</div>`).join("");
-      el("bb").innerHTML = "<h2>Blackboard</h2>" + s.blackboard.map(c => `<div class="row">${c.surface} <code>v${c.version}</code> = ${JSON.stringify(c.value)}</div>`).join("");
+      lastState = s;
+      if (s.run) setRunStatus(s.run.status);
+      el("agents").innerHTML = "<h2>Agents</h2>" + s.agents.map(a =>
+        `<div class="row">${esc(a.id)} ${a.left_at ? "(left)" : "●"} <code>${esc(a.label ?? "")}</code>` +
+        `<span class="age">${a.left_at ? "left " + fmtAge(Date.now() - a.left_at) + " ago" : "joined " + fmtAge(Date.now() - a.joined_at) + " ago"}</span></div>`).join("");
+      renderClaims(s.lock);
+      if (replaySeq == null) {
+        el("bb").innerHTML = "<h2>Blackboard</h2>" + s.blackboard.map(c => rowBb(c.surface, c.version, c.value)).join("");
+      }
       renderGraph(s.lock);
     }
-    async function loadJournal() {
-      const { entries } = await (await fetch(`/api/runs/${current}/journal`)).json();
-      el("journal").innerHTML = "<h2>Journal (seq)</h2>" + entries.map(rowJournal).join("");
-      el("journal").scrollTop = el("journal").scrollHeight;
+    async function loadJournal(sinceSeq) {
+      const url = `/api/runs/${current}/journal${sinceSeq ? `?since=${sinceSeq}` : ""}`;
+      const r = await (await fetch(url)).json();
+      entries = sinceSeq ? entries.concat(r.entries) : r.entries;
+      if (entries.length) lastSeq = entries[entries.length - 1].seq;
+      renderJournal();
+      syncScrub();
     }
-    const rowJournal = (e) => `<div class="row"><span class="seq">${e.seq}</span>${e.type} <code>${e.agent_id ?? ""}</code> ${e.surface ?? ""}</div>`;
-    function selectRun(id) {
-      current = id; el("run").value = id;
+    const rowJournal = (e, replayed) => `<div class="row${replayed ? " replayed" : ""}"><span class="seq">${e.seq}</span>${esc(e.type)} <code>${esc(e.agent_id ?? "")}</code> ${esc(e.surface ?? "")}</div>`;
+    function renderJournal() {
+      const upto = replaySeq;
+      el("journal").innerHTML = "<h2>Journal (seq)</h2>" + entries.map(e => rowJournal(e, upto != null && e.seq <= upto)).join("");
+      if (upto == null) el("journal").scrollTop = el("journal").scrollHeight;
+      else { const r = el("journal").querySelectorAll(".replayed"); if (r.length) r[r.length - 1].scrollIntoView({ block: "center" }); }
+    }
+
+    // ---------- replay scrubber (ended runs) ----------
+    // Reconstruct the Blackboard at any seq by replaying journaled
+    // blackboard.write entries (each carries {version, value}) up to that point.
+    function setRunStatus(status) {
+      currentStatus = status;
+      const ended = status === "ended";
+      el("replay").classList.toggle("show", ended);
+      if (ended && es) { es.close(); es = null; el("status").textContent = "ended — replay available"; }
+      if (!ended) replaySeq = null;
+      syncScrub();
+    }
+    function syncScrub() {
+      if (currentStatus !== "ended") return;
+      const max = lastSeq;
+      el("scrub").max = max;
+      if (replaySeq == null) { el("scrub").value = max; el("scrubPos").textContent = `seq ${max}/${max} (latest)`; }
+    }
+    function replayTo(seq) {
+      replaySeq = seq >= lastSeq ? null : seq;
+      const upto = replaySeq ?? lastSeq;
+      el("scrubPos").textContent = `seq ${upto}/${lastSeq}${replaySeq == null ? " (latest)" : ""}`;
+      const cells = new Map();
+      for (const e of entries) {
+        if (e.seq > upto) break;
+        if (e.type === "blackboard.write" && e.surface) cells.set(e.surface, e.payload ?? {});
+      }
+      const title = replaySeq == null ? "<h2>Blackboard</h2>" : `<h2>Blackboard @ seq ${upto} (replay)</h2>`;
+      if (replaySeq == null && lastState) {
+        el("bb").innerHTML = title + lastState.blackboard.map(c => rowBb(c.surface, c.version, c.value)).join("");
+      } else {
+        el("bb").innerHTML = title + [...cells.entries()].map(([s2, p]) =>
+          rowBb(s2, p.version ?? "?", "value" in p ? p.value : "(value not journaled)")).join("");
+      }
+      renderJournal();
+    }
+    el("scrub").addEventListener("input", (e) => replayTo(Number(e.target.value)));
+    el("scrubEnd").addEventListener("click", () => { el("scrub").value = lastSeq; replayTo(lastSeq); });
+
+    // ---------- live stream (SSE) with reconnect + gap-fill ----------
+    function connectStream(id) {
       if (es) es.close();
-      loadJournal(); refreshRun();
       es = new EventSource(`/api/runs/${id}/stream`);
+      es.onopen = () => {
+        el("status").textContent = "live";
+        refreshRun();
+        if (lastSeq) loadJournal(lastSeq); // fill anything missed while disconnected
+      };
+      es.onerror = () => { el("status").textContent = "reconnecting…"; }; // EventSource auto-retries
       es.addEventListener("journal", (ev) => {
-        el("journal").insertAdjacentHTML("beforeend", rowJournal(JSON.parse(ev.data)));
+        const e = JSON.parse(ev.data);
+        entries.push(e); lastSeq = Math.max(lastSeq, e.seq);
+        el("journal").insertAdjacentHTML("beforeend", rowJournal(e, false));
         el("journal").scrollTop = el("journal").scrollHeight; el("status").textContent = "live";
+        if (e.type === "run.ended") setRunStatus("ended");
       });
       es.addEventListener("state", refreshRun);
     }
+    function selectRun(id) {
+      current = id; el("run").value = id;
+      entries = []; lastSeq = 0; lastState = null; replaySeq = null; currentStatus = "active";
+      el("replay").classList.remove("show");
+      if (es) { es.close(); es = null; }
+      el("status").textContent = "";
+      (async () => {
+        await refreshRun(); // learns run status; toggles replay for ended runs
+        await loadJournal();
+        if (currentStatus === "active") connectStream(id);
+      })();
+    }
     el("run").addEventListener("change", (e) => selectRun(e.target.value));
     el("refresh").addEventListener("click", () => { loadRuns(); refreshRun(); loadJournal(); });
+    // lease countdown ticker (re-renders claim rows from the last snapshot)
+    setInterval(() => { if (lastState && currentStatus === "active") renderClaims(lastState.lock); }, 1000);
 
     // ---------- wait-for graph (Cytoscape) ----------
     let cy = null, lastSig = "";
@@ -206,14 +322,13 @@
       return n ? `${n.name} · model ${n.embed_model} · dim ${n.dim} · ${n.fact_count} active facts` : name;
     }
     function factCard(f, dist) {
-      const tags = (f.tags || []).map(t => `<span class="chip">${t}</span>`).join("");
+      const tags = (f.tags || []).map(t => `<span class="chip">${esc(t)}</span>`).join("");
       const corr = f.corroboration_count > 1 ? `<span class="corr">×${f.corroboration_count}</span>` : "";
       const sup = f.superseded ? `<span class="sup">superseded</span>` : "";
       const d = dist != null ? `<span class="dist">d=${dist.toFixed(3)}</span>` : "";
-      const prov = `from ${f.source_agent_id ?? "?"}${f.source_run_id ? " / " + f.source_run_id : ""}`;
-      return `<div class="fact">${d}<div class="txt">${escapeHtml(f.text)}${corr}${sup}</div><div>${tags}</div><div class="prov">${prov}</div></div>`;
+      const prov = `from ${esc(f.source_agent_id ?? "?")}${f.source_run_id ? " / " + esc(f.source_run_id) : ""}`;
+      return `<div class="fact">${d}<div class="txt">${esc(f.text)}${corr}${sup}</div><div>${tags}</div><div class="prov">${prov}</div></div>`;
     }
-    const escapeHtml = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
     async function showFacts() {
       const name = el("ns").value; if (!name) return;
       el("nsMeta").textContent = nsMetaText(name);

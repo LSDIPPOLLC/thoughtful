@@ -18,7 +18,12 @@ interface Waiter {
   mode: ClaimMode;
   surfaces: Surface[];
   ttlMs: number;
-  /** agents this waiter is blocked behind, snapshotted at enqueue (for deadlock). */
+  /**
+   * Agents this waiter is blocked behind, snapshotted at enqueue (for deadlock).
+   * KNOWN LIMITATION: the snapshot is not refreshed as claims change hands, so a
+   * cycle that forms *after* enqueue (via a later holder) is not detected here —
+   * the lease TTL is the backstop for those (DESIGN §10).
+   */
   holders: Set<string>;
   resolve: (r: ClaimResult) => void;
   timeout: NodeJS.Timeout;
@@ -75,9 +80,10 @@ export class LockManager {
     });
   }
 
-  renew(claimId: string, ttlMs: number): boolean {
+  /** Extend a lease. Only the holding agent may renew (ownership check). */
+  renew(claimId: string, ttlMs: number, agentId: string): boolean {
     const c = this.claims.get(claimId);
-    if (!c) return false;
+    if (!c || c.agentId !== agentId) return false;
     clearTimeout(c.timer);
     c.ttlMs = ttlMs;
     c.expiresAt = now() + ttlMs;
@@ -86,7 +92,10 @@ export class LockManager {
     return true;
   }
 
-  release(claimId: string): boolean {
+  /** Release a claim early. Only the holding agent may release (ownership check). */
+  release(claimId: string, agentId: string): boolean {
+    const c = this.claims.get(claimId);
+    if (!c || c.agentId !== agentId) return false;
     return this.remove(claimId, "claim.released");
   }
 

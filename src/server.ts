@@ -10,7 +10,7 @@ import { buildMcpServer, type Core } from "./mcp.js";
 import type { SessionCtx } from "./types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const GRACE_MS = 10_000;
+const GRACE_MS = Number(process.env.GRACE_MS ?? 10_000); // last-agent-disconnect auto-end grace
 
 interface Session {
   transport: StreamableHTTPServerTransport;
@@ -24,7 +24,7 @@ export function startServer(core: Core, port: number) {
 
   const sessions = new Map<string, Session>();
 
-  // Auto-end a Run a grace period after its last agent disconnects (ADR: Run lifecycle).
+  // Auto-end a Run a grace period after its last agent disconnects (ADR 0008).
   const scheduleAutoEnd = (runId: string) => {
     setTimeout(async () => {
       const run = await core.store.getRun(runId);
@@ -78,6 +78,12 @@ export function startServer(core: Core, port: number) {
   app.delete("/mcp", sessionReq);  // explicit termination
 
   // ---- Read-only viz API ------------------------------------------------
+  app.get("/api/health", (_req, res) => res.json({
+    ok: core.store.journalWriteFailures === 0,
+    journal_write_failures: core.store.journalWriteFailures,
+    sessions: sessions.size,
+  }));
+
   app.get("/api/runs", async (_req, res) => res.json({ runs: await core.store.listRuns() }));
 
   app.get("/api/runs/:id/state", async (req, res) => {
@@ -102,7 +108,8 @@ export function startServer(core: Core, port: number) {
 
   app.get("/api/namespaces/:name/facts", async (req, res) => {
     const includeSuperseded = req.query.superseded === "1";
-    res.json({ facts: await core.facts.listFacts(req.params.name, includeSuperseded) });
+    const sourceRunId = req.query.source_run_id ? String(req.query.source_run_id) : undefined;
+    res.json({ facts: await core.facts.listFacts(req.params.name, includeSuperseded, sourceRunId) });
   });
 
   app.get("/api/namespaces/:name/search", async (req, res) => {
@@ -117,14 +124,18 @@ export function startServer(core: Core, port: number) {
   // Global run-lifecycle stream — a distiller subscribes here and distills each
   // Run when it ends (ADR 0006; "auto" distillation is a convention, not server
   // magic). Emits `run.ended` events across all Runs.
+  // Heartbeat comment so idle proxies don't silently kill SSE streams.
+  const SSE_HEARTBEAT_MS = 25_000;
+
   app.get("/api/events", (_req, res) => {
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
     res.write(`event: hello\ndata: {}\n\n`);
     const onJournal = (e: any) => {
       if (e.type === "run.ended") res.write(`event: run.ended\ndata: ${JSON.stringify({ run_id: e.run_id })}\n\n`);
     };
+    const beat = setInterval(() => res.write(`: hb\n\n`), SSE_HEARTBEAT_MS);
     bus.on("journal", onJournal);
-    _req.on("close", () => bus.off("journal", onJournal));
+    _req.on("close", () => { clearInterval(beat); bus.off("journal", onJournal); });
   });
 
   // Live tail via SSE — pushed straight from the in-process bus, no polling.
@@ -138,9 +149,11 @@ export function startServer(core: Core, port: number) {
     res.write(`event: hello\ndata: ${JSON.stringify({ run: id })}\n\n`);
     const onJournal = (e: unknown) => res.write(`event: journal\ndata: ${JSON.stringify(e)}\n\n`);
     const onState = () => res.write(`event: state\ndata: {}\n\n`);
+    const beat = setInterval(() => res.write(`: hb\n\n`), SSE_HEARTBEAT_MS);
     bus.on(`journal:${id}`, onJournal);
     bus.on(`state:${id}`, onState);
     req.on("close", () => {
+      clearInterval(beat);
       bus.off(`journal:${id}`, onJournal);
       bus.off(`state:${id}`, onState);
     });

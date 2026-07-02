@@ -16,10 +16,10 @@ the glossary, and [docs/adr/](./docs/adr/) for the load-bearing decisions.
   an in-memory lock manager, blocking long-poll, and wait-for-graph deadlock
   detection.
 - **Viz** — embedded read-only HTTP + SSE UI. Two modes: a one-Run dashboard
-  (agents, locks, blackboard, seq journal, wait-for graph) and a Namespace-scoped
-  **Facts** view with live semantic search.
-
-Facts / semantic memory are v1.5 (not yet built).
+  (agents, locks + lease countdowns, blackboard, seq journal, wait-for graph,
+  and a **replay scrubber** for ended Runs) and a Namespace-scoped **Facts**
+  view with semantic search.
+- **Facts (v1.5)** — durable semantic memory: implemented and verified (see below).
 
 ## Run it
 
@@ -28,7 +28,8 @@ npm install
 npm run dev          # tsx watch — MCP at http://localhost:8787/mcp, viz at http://localhost:8787/
 ```
 
-Env: `PORT` (default 8787), `DB_PATH` (default `thoughtful.db`).
+Env: `PORT` (default 8787), `DB_PATH` (default `thoughtful.db`), `GRACE_MS`
+(auto-end grace, default 10s). Full template in [.env.example](./.env.example).
 
 ## Architecture in one breath
 
@@ -126,17 +127,23 @@ npm run test:qwen:e2e # real semantic retrieval through the full MCP stack
 ## Status
 
 **Full system verified end-to-end.** `npm test` boots the server and drives live
-MCP agent sessions through **20 assertions, all passing**: exclusive grant,
-enforced Blackboard writes, overlapping-claim denial + attribution, sibling
-non-conflict, shared+shared coexistence, blocking-claim queue→grant, wait-for
-deadlock detection + reject, seq-ordered journalling, and the full Fact flow
-(write, corroborate, distinct, semantic search, namespace pinning).
+MCP agent sessions through two suites — the smoke path (exclusive grant, enforced
+Blackboard writes, overlapping-claim denial + attribution, sibling non-conflict,
+shared+shared coexistence, blocking-claim queue→grant, wait-for deadlock
+detection + reject, seq-ordered journalling, the full Fact flow) and a behavior
+coverage suite (lease expiry, renew + ownership, disconnect reclaim, grace-period
+auto-end, frozen-run enforcement, purge guard, journal filters,
+`expected_version` conflicts, fact supersede + search filters, SSE streams,
+3-agent deadlock, distiller catch-up).
 
 ```bash
-npm run typecheck   # clean
+npm run typecheck   # clean (src + test)
 npm test            # ALL PASS
 ```
 
+Tool errors are machine-readable: `{ code, message }` with codes like
+`NO_CLAIM`, `VERSION_CONFLICT`, `RUN_ENDED`, `RUN_ACTIVE`, `PAYLOAD_TOO_LARGE`.
+Blackboard values and journal payloads are capped at 256KB serialized.
+
 See DESIGN.md §10 for implementation notes (async Turso driver, beta-engine
-quirks, embedding stub). Next: wire a real Qwen embedder and surface Facts in the
-viz.
+quirks) and §11 for open items.

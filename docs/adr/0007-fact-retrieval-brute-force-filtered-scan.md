@@ -4,7 +4,7 @@ Date: 2026-07-01
 
 ## Status
 
-Accepted (scopes v1.5)
+Accepted (scopes v1.5) — amended 2026-07-02 (implementation mechanism; see Amendment)
 
 ## Context
 
@@ -71,3 +71,25 @@ partitioning — is a non-migration.
   already in the schema. Revisit when a Namespace actually approaches that size.
 - The embedding dimension is fixed per Namespace (ADR 0006), so the `F32_BLOB(dim)`
   column and any future per-Namespace index are well-defined.
+
+## Amendment (2026-07-02): vectors stored as JSON, cosine computed in JS
+
+The **decision holds** (brute-force filtered scan, filter-first, ANN deferred),
+but the storage/execution mechanism shipped differently from the SQL sketched
+above: embeddings are stored as **JSON arrays in a TEXT column** and cosine
+similarity is computed **in JavaScript** after a plain
+`WHERE namespace = ? AND superseded_by IS NULL` scan (`src/factStore.ts`), not
+via `F32_BLOB` + `vector_distance_cos()` in SQL.
+
+Why (see also DESIGN.md §10):
+
+- The beta `@tursodatabase/database` driver had vector-encoding quirks, and
+  hitting unimplemented engine paths can panic the whole process (as correlated
+  subqueries already did).
+- JSON storage is provider-agnostic across differing dims (Qwen 1024 / MiniMax
+  1536 / stub 256) with zero encoding ceremony.
+
+Same complexity class (O(n) per query, n = active Facts in the Namespace); the
+JS hop matters only at scales where ANN would be the answer anyway. **Switch to
+`F32_BLOB` + native `vector_distance_cos` when adding the per-Namespace ANN
+index** — that migration re-encodes the same numbers, no semantic change.

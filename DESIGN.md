@@ -109,8 +109,10 @@ backstop. The same graph powers the viz contention view. (ADR 0004)
 **Journal:** `journal_append` · `journal_read({since_seq?, agent_id?, type?, surface?})`
 **Facts (v1.5):** `fact_write(namespace, text, tags?)` · `fact_search(namespace, query, k, filter?)` · `list_namespaces()`
 
-Notes: `claim` returns `granted | queued | denied | DEADLOCK`; `block=true`
-long-polls server-side. `bb_write` optional `expected_version` → `409` on mismatch
+Notes: `claim` returns `granted | queued | denied | deadlock`; `block=true`
+long-polls server-side. Tool errors are structured `{ code, message }`
+(`NO_CLAIM`, `VERSION_CONFLICT`, `RUN_ENDED`, `RUN_ACTIVE`, `PAYLOAD_TOO_LARGE`,
+…). `bb_write` optional `expected_version` → `VERSION_CONFLICT` on mismatch
 (catches a claim lost to TTL mid-work). `bb_read` supports path-prefix survey;
 entity reads are exact. `release` is the normal path; Leases are the crash net.
 `fact_write` auto-fills provenance from the caller's session and auto-creates the
@@ -206,7 +208,8 @@ coordination spine; reuses the same server + Turso file.
 - [ADR 0004](./docs/adr/0004-deadlock-detection-wait-for-graph.md) — deadlock detection via wait-for graph, reject the requester
 - [ADR 0005](./docs/adr/0005-typescript-node-single-threaded-lock-manager.md) — TypeScript/Node; event loop as the lock-manager mutex
 - [ADR 0006](./docs/adr/0006-fact-pipeline-agent-distill-server-embed.md) — Fact pipeline: agent-side distillation, server-side pinned embeddings (Qwen local / MiniMax opt-in)
-- [ADR 0007](./docs/adr/0007-fact-retrieval-brute-force-filtered-scan.md) — Fact retrieval: brute-force filtered scan, ANN deferred
+- [ADR 0007](./docs/adr/0007-fact-retrieval-brute-force-filtered-scan.md) — Fact retrieval: brute-force filtered scan, ANN deferred (amended: JSON vectors + JS cosine until the ANN migration)
+- [ADR 0008](./docs/adr/0008-run-lifecycle-freeze-and-reclaim.md) — Run lifecycle: grace-period auto-end, enforced freeze on end, restart recovery sweep
 
 ## 10. Implementation notes (from building against the beta engine)
 
@@ -235,11 +238,40 @@ coordination spine; reuses the same server + Turso file.
 
 ## 11. Known open items
 
-- Distiller idempotency: re-distilling a Run relies on the server's
-  corroborate/supersede dedup rather than tracking already-distilled Runs.
+Closed by the 2026-07-02 hardening pass (kept here for the record):
+
+- ~~Blackboard value size caps~~ — 256KB serialized cap on Blackboard values and
+  Journal payloads, `PAYLOAD_TOO_LARGE`.
+- ~~Distiller missed-event hole~~ — the distiller now runs a catch-up scan on
+  connect (any ended Run with no fact attributed to it gets distilled); repeat
+  distillation stays deduped server-side.
+- ~~Replay~~ — the viz has a replay scrubber for ended Runs; journaled
+  `blackboard.write` entries now carry `{version, value}` so replay truly
+  reconstructs Blackboard evolution (the §4 Seq invariant, now real).
+- ~~Frozen-run enforcement~~ — `claim`/`bb_write`/`journal_append` on an ended
+  Run are rejected (`RUN_ENDED`); `purge_run` refuses active Runs sans `force`.
+- ~~Structured errors~~ — tools return `{ code, message }` instead of bare text.
+- ~~renew/release ownership~~ — only the holding agent may renew or release.
+
+Still open:
+
+- **Dedup nuance**: a write ≥ T2-similar to an existing Fact corroborates and
+  **discards the new wording** — a genuine update phrased near-identically loses
+  its text. Defensible (the knowledge is "the same"), but an agent wanting the
+  new wording must phrase it distinctly enough to supersede instead.
+- **Journal durability counter**: a journal INSERT that fails after seq
+  assignment is a permanent gap (SSE already published it). Detected and
+  surfaced via `/api/health` (`journal_write_failures`); prevention would break
+  the lock manager's synchronous-mutation guarantee (ADR 0005).
+- **Deadlock edge staleness**: a waiter's blocked-behind set is snapshotted at
+  enqueue; a cycle formed later (holder becomes waiter behind a new holder) is
+  only broken by lease TTL.
+- **Session idle-reaping**: a hard-crashed client's session lingers (lease TTL
+  frees its Claims, but a Run whose only agents hard-crashed stays active until
+  a restart) — see ADR 0008.
 - Distiller Namespace routing is a single `DISTILL_NAMESPACE` (default
   `distilled`); no per-Run/per-domain mapping yet.
-- Frontend polish (reversible) — wait-for graph now uses Cytoscape; Blackboard /
-  Journal / Facts still render as plain rows/cards.
-- Blackboard value size caps and long-Run file growth / retention cap (deferred).
+- Namespace re-embed migration (change of pinned model) has no tool; the pin
+  guard throws, migration is manual.
+- Long-Run file growth / retention cap (deferred).
 - Auth: none in v1 (single-host, local); revisit if exposed over a network.
